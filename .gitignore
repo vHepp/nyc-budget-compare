@@ -1,6 +1,7 @@
 /.vscode
 .DS_Store
 /Docs
+/Python/.data_cache
 
 
 # Byte-compiled / optimized / DLL files

@@ -1,9 +1,0 @@
-numpy
-pandas
-matplotlib
-ipykernel
-camelot-py[cv]
-pdfplumber
-tqdm
-jupyter
-ipywidgets
