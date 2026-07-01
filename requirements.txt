@@ -8,4 +8,6 @@ tqdm
 jupyter
 ipywidgets
 
+openpyxl
+
 sodapy
