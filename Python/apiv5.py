@@ -16,7 +16,7 @@ version = "5"
 client = Socrata(
     "data.cityofnewyork.us",
     APP_KEY,
-    timeout=90
+    timeout=180
 )
 
 RELEASE_NAMES = ["prelim", "exec", "adopt"]
