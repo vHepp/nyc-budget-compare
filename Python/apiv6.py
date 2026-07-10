@@ -70,10 +70,7 @@ def main(args):
      
     # Query Data if necessary
     
-    data = []
-    offset = 0
 
-    limit = 1000
 
     try:
         print(f"Attempting to load cached data for fiscal year {planned_fy}...")
@@ -81,30 +78,47 @@ def main(args):
     except Exception as e:
         # print(e)
         print(f"No cached data found. Querying for fiscal year {planned_fy}...\n")
-        while True:
-            print(f"Fetching rows starting at offset: {offset}")
+        
+        count_result = client.get(
+            dataset_identifier=EXPENSE_DATASET_ID,
+            select="COUNT(*)",
+            where=where_string
+        )
+        
+        total_rows = int(count_result[0]['COUNT'])
+        print(f"Total rows to fetch: {total_rows}")
+        
+        data = []
+        offset = 0
+        limit = 1000
+        
+        with tqdm(total=total_rows, desc="Downloading Data", unit="rows") as pbar:
+            while True:
+                # print(f"Fetching rows starting at offset: {offset}")
 
-            temp = client.get(
-                dataset_identifier=EXPENSE_DATASET_ID,
-                # select=select_string,
-                where=where_string,
-                # group=groupby_string,
-                order=orderby_string,
-                # order=":id",
-                limit=limit,
-                offset=offset
-            )
-            
-            if not temp:
-                break
-            
-            # print(temp[0])
-            
-            data.extend(temp)
-            
-            offset += limit
-            
-            # break
+                temp = client.get(
+                    dataset_identifier=EXPENSE_DATASET_ID,
+                    # select=select_string,
+                    where=where_string,
+                    # group=groupby_string,
+                    order=orderby_string,
+                    # order=":id",
+                    limit=limit,
+                    offset=offset
+                )
+                
+                if not temp:
+                    break
+                
+                # print(temp[0])
+                
+                data.extend(temp)
+                
+                pbar.update(len(temp))
+                
+                offset += limit
+                
+                # break
                 
         print(f"End of query. Successfully fetched {len(data)} total rows.")
         
@@ -184,6 +198,8 @@ def main(args):
         "object_class_name",
         "object_code",
         "object_code_name",
+        "intra_city_purchase_code",                                # <--- ADD THIS
+        "personal_service_other_than_personal_service_indicator"   # <--- AND THIS
     ]
 
     master_categorical_cols = [
@@ -201,6 +217,8 @@ def main(args):
         "object_class_name",
         "object_code",
         "object_code_name",
+        "intra_city_purchase_code",                                # <--- ADD THIS
+        "personal_service_other_than_personal_service_indicator"   # <--- AND THIS
     ]
 
     all_categorical_cols = [
@@ -261,15 +279,6 @@ def main(args):
         "personal_service_other_than_personal_service_indicator", # 12: 
         "financial_plan_savings_flag", # 13: 
         *numeric_cols
-        # "adopted_budget_amount", # 14: 
-        # "current_modified_budget_amount", # 15: 
-        # "financial_plan_amount", # 16: 
-        # "adopted_budget_position", # 17: 
-        # "current_modified_budget_position", # 18: 
-        # "financial_plan_position", # 19: 
-        # "adopted_budget_number_of_contracts", # 20: 
-        # "current_modified_budget_number_of_contracts", # 21: 
-        # "financial_plan_number_of_contracts", # 22: 
         ]
     ]
      
@@ -304,6 +313,8 @@ def main(args):
     df_pivot[numeric_cols] = df_pivot[numeric_cols].fillna(0)
     
 
+    print(df_pivot.columns)
+    print(df_pivot.head())
 
     # Track releases
     pub_dates = df_pivot["publication_date"].sort_values(ascending=True).unique().tolist()[:]
@@ -314,20 +325,12 @@ def main(args):
 
      
     # Set up base DataFrame and map function
-    # 
 
     
     base_df = df_pivot[target_categorical_cols].drop_duplicates().reset_index(drop=True)
     len(base_df)
 
      
-    # Loop through each release
-    # 
-
-    
-    # print(pub_dates)
-
-    # print(planned_fy)
 
     for i, pub_date in enumerate(pub_dates):
         release_name = RELEASE_NAMES[i]
@@ -338,7 +341,6 @@ def main(args):
 
      
     # Collapse Releases
-    # 
 
     
     collapsed_df = base_df.copy()
@@ -354,12 +356,6 @@ def main(args):
         
         ith_release_df = df_pivot[df_pivot["publication_date"] == pub_date][target_categorical_cols + numeric_cols].copy()
         
-        # print(len(ith_release_df))
-        
-        # print(i)
-        
-        # print(ith_release_df.columns[len(categorical_cols):])
-        
         if i <= 2:
             
             plan_cols = [str_sum_financial_plan_amount, str_sum_financial_plan_position]
@@ -368,15 +364,12 @@ def main(args):
                 
             # for col in [str_sum_financial_plan_amount, str_sum_financial_plan_position, str_sum_financial_plan_number_of_contracts]:
             for col in plan_cols:
-                # print(col)
                 if col in ith_release_df.columns:
                     ith_release_df = ith_release_df.rename(
                         columns={
                             f"{col}":f"{col}_{RELEASE_NAMES[i]}",
                             }
                     )
-                # print()
-                # print(ith_release_df.columns)
         
             if i < num_pubs_this_year - 1:
                 ith_release_df = ith_release_df.drop(columns=[
@@ -396,39 +389,17 @@ def main(args):
                         str_sum_current_modified_number_of_contracts,
                         ])
                 
-            # print(f"Adding new numeric columns:{ith_release_df.columns[start_of_numerical_cols:]}\n")
             new_numeric_cols.extend(ith_release_df.columns[start_of_numerical_cols:])
         else:
             raise Exception(f"Bad indexing, i:{i} >= num_pubs_this_year or i:{i} < 0")
         
-        # print(ith_release_df.columns)
-        # print()
+
         
         collapsed_df = collapsed_df.merge(right=ith_release_df,on=target_categorical_cols, how='left')
-        
-        # break
 
-    # collapsed_df = collapsed_df.reset_index(drop=True)
-
-
-    # print(len(base_df))
-    # print(len(collapsed_df))
-
-
-    collapsed_df.columns
-
-    
-    new_numeric_cols
-
-    
-    collapsed_df
-
-    
-    collapsed_df[collapsed_df.duplicated(keep=False)]
 
      
     # Object Code Level
-    # 
 
     
     Object_Code_cols = [
@@ -447,27 +418,17 @@ def main(args):
         # "financial_plan_savings_flag",
     ]
 
-    main_cols = [
-        # 'adopted_budget_amount',
-        # 'current_modified_budget_amount',
-        f'{str_sum_current_adopted_amount}',
-        f'{str_sum_current_modified_amount}',
-        f'{str_sum_financial_plan_amount}_{RELEASE_NAMES[i]}',
-    ]
+    # main_cols = [
+    #     # 'adopted_budget_amount',
+    #     # 'current_modified_budget_amount',
+    #     f'{str_sum_current_adopted_amount}',
+    #     f'{str_sum_current_modified_amount}',
+    #     f'{str_sum_financial_plan_amount}_{RELEASE_NAMES[i]}',
+    # ]
 
-    object_code_collapsed_df = collapsed_df.groupby(Object_Code_cols,dropna=False).sum().reset_index()
-
-    object_code_collapsed_df = object_code_collapsed_df[Object_Code_cols + new_numeric_cols]
-
-    object_code_collapsed_df[Object_Code_cols + main_cols]
-
-
-    
-    # object_code_collapsed_df[object_code_collapsed_df.duplicated(keep=False)]
-
+    object_code_collapsed_df = collapsed_df[Object_Code_cols + new_numeric_cols].groupby(Object_Code_cols,dropna=False).sum().reset_index()
      
     # Object Class Level
-    # 
 
     
     Object_Class_cols = [
@@ -486,19 +447,10 @@ def main(args):
         # "financial_plan_savings_flag",
     ]
 
-    object_class_collapsed_df = collapsed_df.groupby(Object_Class_cols,dropna=False).sum().reset_index()
-
-    object_class_collapsed_df = object_class_collapsed_df[Object_Class_cols + new_numeric_cols]
-
-    object_class_collapsed_df[Object_Class_cols + main_cols]
-
-
-    
-    # object_code_collapsed_df[object_code_collapsed_df.duplicated(keep=False)]
+    object_class_collapsed_df = collapsed_df[Object_Class_cols + new_numeric_cols].groupby(Object_Class_cols,dropna=False).sum().reset_index()
 
      
     # Budget Code Level
-    # 
 
     
     Budget_Code_cols = [
@@ -519,18 +471,8 @@ def main(args):
 
     budget_code_collapsed_df = collapsed_df[Budget_Code_cols + new_numeric_cols].groupby(Budget_Code_cols,dropna=False).sum().reset_index()
 
-    # budget_code_collapsed_df = budget_code_collapsed_df[Budget_Code_cols + new_numeric_cols]
-
-    # budget_code_collapsed_df[Budget_Code_cols + main_cols]
-
-    budget_code_collapsed_df
-
-    
-    # budget_code_collapsed_df[budget_code_collapsed_df.duplicated(keep=False)]
-
      
     # Responsibility Center Level
-    # 
 
     
     RC_cols = [
@@ -551,18 +493,8 @@ def main(args):
 
     RC_collapsed_df = collapsed_df[RC_cols + new_numeric_cols].groupby(RC_cols,dropna=False).sum().reset_index()
 
-    # RC_collapsed_df = RC_collapsed_df[RC_cols + new_numeric_cols]
-
-    RC_collapsed_df
-    # RC_collapsed_df[RC_cols + main_cols]
-    # RC_collapsed_df[RC_collapsed_df['agency_name'] == "DEPARTMENT OF EDUCATION"][RC_cols + main_cols]
-
-    
-    # RC_collapsed_df[RC_collapsed_df.duplicated(keep=False)]
-
      
     # Unit of Appropriation Level
-    # 
 
     
     UoA_cols = [
@@ -583,18 +515,8 @@ def main(args):
 
     UoA_collapsed_df = collapsed_df[UoA_cols + new_numeric_cols].groupby(UoA_cols,dropna=False).sum().reset_index()
 
-    # UoA_collapsed_df = UoA_collapsed_df[UoA_cols + new_numeric_cols]
-
-    UoA_collapsed_df
-    # UoA_collapsed_df[UoA_cols + main_cols]
-    # UoA_collapsed_df[UoA_collapsed_df['agency_name'] == "DEPARTMENT OF EDUCATION"][UoA_cols + main_cols]
-
-    
-    # UoA_collapsed_df[UoA_collapsed_df.duplicated(keep=False)]
-
      
     # Agency Level
-    # 
 
     
     Agency_cols = [
@@ -615,15 +537,8 @@ def main(args):
 
     Agency_collapsed_df = collapsed_df[Agency_cols + new_numeric_cols].groupby(Agency_cols,dropna=False).sum().reset_index()
 
-    # Agency_collapsed_df = Agency_collapsed_df[Agency_cols + new_numeric_cols]
-
-    # Agency_collapsed_df[Agency_cols + main_cols]
-    Agency_collapsed_df
-
      
     # Write to excel
-    # 
-
     
     
     def add_diff_cols(df):
@@ -721,7 +636,7 @@ def main(args):
     
     from openpyxl.utils import get_column_letter
 
-    output_filename = f"final_export_{planned_fy}.xlsx"
+    output_filename = f"{planned_fy_name}_expenses_v{version}_{date.today()}.xlsx"
 
     # 1. Group your sheets into a dictionary to easily loop through them
     sheets_to_write = {
@@ -814,20 +729,7 @@ if __name__ == "__main__":
     #     required=True,
     #     help="Choose whether to train a new model, run inference, or do both. ['train', 'inference', 'both'].",
     # )
-    # parser.add_argument(
-    #     "--model_name",
-    #     type=str,
-    #     # required=True,
-    #     help="Base name for saving/loading the models.",
-    # )
-
-    # parser.add_argument(
-    #     "--submission_name",
-    #     type=str,
-    #     default=None,
-    #     help="Name of csv file containing inference results. Defaults to submission_cellpose.",
-    # )
-
+    
     # parser.add_argument(
     #     "--epochs",
     #     type=int,
@@ -836,51 +738,10 @@ if __name__ == "__main__":
     # )
 
     # parser.add_argument(
-    #     "--batch_size",
-    #     type=int,
-    #     default=1,
-    #     help="Size of training batches (default 1).",
-    # )
-
-    # parser.add_argument(
     #     "--val_size",
     #     type=float,
     #     default=0.2,
     #     help="Proportion of sessions to use for validation in 'single' mode (default 0.2).",
-    # )
-
-    # parser.add_argument(
-    #     "--subset",
-    #     type=float,
-    #     default=1.0,
-    #     help="Portion of training sessions to use. Lower values mean training on smaller subsets and faster prototyping (default 1.0).",
-    # )
-
-    # --- NEW HYPERPARAMETERS ---
-    # parser.add_argument(
-    #     "--stitch_threshold",
-    #     type=float,
-    #     default=0.5,
-    # )
-
-    # parser.add_argument(
-    #     "--flow_threshold",
-    #     type=float,
-    #     default=0.4,
-    # )
-
-    # parser.add_argument(
-    #     "--cellprob_threshold",
-    #     type=float,
-    #     default=0.0,
-    #     help="Threshold for cell probability. Lower values (e.g., -1.5) expand the predicted masks.",
-    # )
-
-    # parser.add_argument(
-    #     "--min_size",
-    #     type=int,
-    #     default=15,
-    #     help="Minimum size of cells (in voxels/pixels). Masks smaller than this are deleted.",
     # )
 
     # ---------------------------
