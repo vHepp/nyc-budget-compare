@@ -722,30 +722,6 @@ if __name__ == "__main__":
         help="Includes number of contracts columns in analysis.",
     )
 
-    # parser.add_argument(
-    #     "--mode",
-    #     type=str,
-    #     choices=["train", "inference", "both"],
-    #     required=True,
-    #     help="Choose whether to train a new model, run inference, or do both. ['train', 'inference', 'both'].",
-    # )
-    
-    # parser.add_argument(
-    #     "--epochs",
-    #     type=int,
-    #     default=50,
-    #     help="Number of epochs to train each fold for (default 50).",
-    # )
-
-    # parser.add_argument(
-    #     "--val_size",
-    #     type=float,
-    #     default=0.2,
-    #     help="Proportion of sessions to use for validation in 'single' mode (default 0.2).",
-    # )
-
-    # ---------------------------
-
     args = parser.parse_args()
 
     main(args)
