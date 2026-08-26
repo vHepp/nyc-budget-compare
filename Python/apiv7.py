@@ -123,13 +123,12 @@ def fetch_data(client: Socrata, all_years_to_query: list) -> pd.DataFrame:
 
     data = []
     offset = 0
-    limit = 1000
+    limit = 50000
 
     with tqdm(total=total_rows, desc="Downloading Data", unit="rows") as pbar:
         while True:
             temp = client.get(
                 dataset_identifier=EXPENSE_DATASET_ID,
-                
                 where=where_string,
                 order=orderby_string,
                 limit=limit,
@@ -154,10 +153,9 @@ def fetch_data(client: Socrata, all_years_to_query: list) -> pd.DataFrame:
         y_releases_zip = zip(y_releases, RELEASE_NAMES[:len(y_releases)])
         # print(y_releases_zip)
         
-        for y, r in y_releases_zip:
-            releases_map.update({y:r})
-    
-    print(f"releases_map: {releases_map}")
+        for pub_date, release_name in y_releases_zip:
+            print({pub_date:release_name})
+            releases_map.update({pub_date:release_name})
     
     df['release_type'] = df["publication_date"].map(releases_map)
         
@@ -165,26 +163,47 @@ def fetch_data(client: Socrata, all_years_to_query: list) -> pd.DataFrame:
     
     return df
 
-def clean(df: pd.DataFrame, verbose:bool = False) -> pd.DataFrame:
+def clean(df: pd.DataFrame, no_amounts: bool = False, no_positions: bool = False, no_contracts: bool = False, verbose: bool = False) -> pd.DataFrame:
     df[TARGET_CATEGORICAL_COLS] = df[TARGET_CATEGORICAL_COLS].astype(str)
     
     for cat_col in TARGET_CATEGORICAL_COLS:
         if cat_col in df.columns:
             df[cat_col] = df[cat_col].str.upper()
     
-    #filling empty categorical cells with "(blank)"
+    # Fill empty categorical cells with "(blank)"
     df[TARGET_CATEGORICAL_COLS] = df[TARGET_CATEGORICAL_COLS].fillna("(blank)")
     
-    # Explicitly aggregate numerical columns to prevent Pandas 2.0+ TypeErrors
-    df = df.groupby(ALL_CATEGORICAL_COLS, dropna=False)[NUMERICAL_COLS].sum().reset_index()
+    # --- FILTER NUMERICAL COLUMNS ---
+    active_num_cols = NUMERICAL_COLS.copy()
     
-    # sort by hierarchy
+    if no_amounts:
+        active_num_cols = [c for c in active_num_cols if "amount" not in c.lower()]
+    
+    if no_positions:
+        active_num_cols = [c for c in active_num_cols if "position" not in c.lower()]
+        
+    if no_contracts:
+        active_num_cols = [c for c in active_num_cols if "contract" not in c.lower()]
+    
+    if not active_num_cols:
+        raise ValueError("All numerical columns have been filtered out! You must leave at least one numerical column type to aggregate.")
+    
+    # --- CAST NUMERIC COLUMNS TO FLOAT/INT ---
+    for num_col in active_num_cols:
+        if num_col in df.columns:
+            df[num_col] = pd.to_numeric(df[num_col], errors='raise').fillna(0)
+    # ----------------------------------------
+
+    # Aggregate numerical columns to prevent Pandas 2.0+ TypeErrors
+    df = df.groupby(ALL_CATEGORICAL_COLS, dropna=False)[active_num_cols].sum().reset_index()
+    
+    # Sort by hierarchy
     order = TARGET_CATEGORICAL_COL_CODES + ["publication_date"]
     ascending = [True] * len(TARGET_CATEGORICAL_COL_CODES) + [False]
     
     if verbose:
         print(f"column, direction\n")
-        for o,a in zip(order, ascending):
+        for o, a in zip(order, ascending):
             if a:
                 print(f"{o}, ascending")
             else:
@@ -192,11 +211,12 @@ def clean(df: pd.DataFrame, verbose:bool = False) -> pd.DataFrame:
                 
     return df.sort_values(by=order, ascending=ascending).reset_index(drop=True)
 
-def collapse(clean_df: pd.DataFrame, verbose:bool = False) -> pd.DataFrame:
+def collapse(clean_df: pd.DataFrame, latest_interim_only: bool = False, verbose:bool = False) -> pd.DataFrame:
     
     collapsed_df = clean_df[TARGET_CATEGORICAL_COLS].drop_duplicates().reset_index(drop=True)
     
     years_arr = sorted(clean_df['fiscal_year'].unique())
+    max_fy = years_arr[-1]  # Identifies the most recent year
     
     if verbose:
         print(f"num_years: {len(years_arr)}")
@@ -208,59 +228,73 @@ def collapse(clean_df: pd.DataFrame, verbose:bool = False) -> pd.DataFrame:
             
         fy_df = clean_df[clean_df['fiscal_year'] == fy]
         
-        releases_arr = sorted(fy_df['release_type'].unique(),reverse=True)
+        present_releases = [r for r in RELEASE_NAMES if r in fy_df['release_type'].unique()]
         
-        # present_releases = [r for r in RELEASE_NAMES if r in fy_df['release_type'].unique()]
-
-        num_releases = len(releases_arr)
+        # Filter out interim releases for all historical years
+        if latest_interim_only and fy != max_fy:
+            present_releases = [r for r in present_releases if r == "adopt"]
 
         if verbose:
-            print(f"num_releases: {num_releases}")
-            print(releases_arr)
+            print(f"num_releases: {len(present_releases)}")
+            print(present_releases)
         # print()
         
-        for j, release_type in enumerate(releases_arr):
+        for j, release_type in enumerate(present_releases):
             if verbose:
                 print(f"Release {j}: {release_type}")
 
-            fy_release_df = fy_df[fy_df['release_type'] == release_type]
-            
-            fy_release_df = fy_release_df.drop(columns=["publication_date", "fiscal_year", "release_type"])
-            
-            
+            fy_release_df = fy_df[fy_df['release_type'] == release_type].drop(columns=["publication_date", "fiscal_year", "release_type"])
             
             fy_release_rename_map = rename_cols(fy, release_type)
-            
+            if verbose:
+                print(fy_release_rename_map)
             fy_release_renamed_df = fy_release_df.rename(columns=fy_release_rename_map)
-            # print("DEBUG 2")
 
-            if j < num_releases - 1:
+            # Preserve adopted/modified baseline columns on the final available release of the year.
+            # The current_modified_budget columns are the closest to actuals we can get at the moment.
+            if j < len(present_releases) - 1:
                 drop_cols = [
-                    'adopted_budget_amount',
-                    'current_modified_budget_amount',
-                    'adopted_budget_position',
-                    'current_modified_budget_position',
-                    'adopted_budget_number_of_contracts',
-                    'current_modified_budget_number_of_contracts']
-                fy_release_renamed_df = fy_release_renamed_df.drop(columns=[fy_release_rename_map.get(col_name) for col_name in drop_cols])
-            # print("DEBUG 3")
+                    'adopted_budget_amount', 'current_modified_budget_amount',
+                    'adopted_budget_position', 'current_modified_budget_position',
+                    'adopted_budget_number_of_contracts', 'current_modified_budget_number_of_contracts'
+                ]
+                to_drop = [fy_release_rename_map[col] for col in drop_cols if col in fy_release_rename_map]
+                fy_release_renamed_df = fy_release_renamed_df.drop(columns=to_drop, errors='ignore')
 
-            # fy_release_renamed_df
-            collapsed_df = collapsed_df.merge(right=fy_release_renamed_df,on=TARGET_CATEGORICAL_COLS, how='left')
+            collapsed_df = collapsed_df.merge(right=fy_release_renamed_df, on=TARGET_CATEGORICAL_COLS, how='left')
     
         if verbose:
             print()
             print(collapsed_df.columns)    
             print()
     
-    new_numeric_cols = list(set(collapsed_df.columns) - set(TARGET_CATEGORICAL_COLS))
-    new_numeric_cols = sorted(new_numeric_cols)
-    print(new_numeric_cols)
+    # --- ADD THIS BLOCK TO REMOVE DUPLICATES ---
+    duplicate_cols_to_drop = []
+    for col in collapsed_df.columns:
+        if "_adopt_financial_plan_" in col:
+            # Determine the name of the equivalent baseline column
+            equivalent_baseline = col.replace("_adopt_financial_plan_", "_adopted_budget_")
+            
+            # If the baseline exists (e.g., fetched from the following year's data), we can drop the duplicate
+            if equivalent_baseline in collapsed_df.columns:
+                duplicate_cols_to_drop.append(col)
+                
+    if verbose and duplicate_cols_to_drop:
+        print(f"Dropping redundant financial plan columns: {duplicate_cols_to_drop}\n")
+        
+    collapsed_df = collapsed_df.drop(columns=duplicate_cols_to_drop)
+    # -------------------------------------------
     
-    collapsed_df[new_numeric_cols] = collapsed_df[new_numeric_cols].fillna(0)
-    collapsed_df = collapsed_df[OUTPUT_ORDER + new_numeric_cols]
     
-    return collapsed_df, new_numeric_cols
+    new_numeric_cols = sorted(list(set(collapsed_df.columns) - set(TARGET_CATEGORICAL_COLS)), reverse=True)
+    # if verbose:
+    #     print(new_numeric_cols)
+    
+    collapsed_df[new_numeric_cols] = collapsed_df[new_numeric_cols].apply(pd.to_numeric, errors='raise').fillna(0)
+    # collapsed_df[new_numeric_cols] = collapsed_df[new_numeric_cols].fillna(0)
+    
+    
+    return collapsed_df[OUTPUT_ORDER + new_numeric_cols], new_numeric_cols
 
 def rename_cols(fy:str, release_type:str) -> dict:
     return {
@@ -373,7 +407,10 @@ def main(args):
     planned_fy = args.fiscal_year
     num_prev_years = args.num_prev_years
     no_diffs=args.no_diffs
-    include_contracts=args.include_contracts
+    no_amounts = args.no_amounts
+    no_positions = args.no_positions
+    no_contracts=args.no_contracts
+    latest_interim_only = args.latest_interim_only
     
     
     all_years_to_query = [int(planned_fy) - i for i in range(num_prev_years+1)]
@@ -384,10 +421,7 @@ def main(args):
     
     # Create shorthand FY names
     planned_fy_name = f"FY{planned_fy % 100}"
-    current_fy_name = f"FY{(planned_fy - 1) % 100}"
-    
-    
-    
+    min_fy_name = f"FY{(min(all_years_to_query) - 1) % 100}"
     
     print(f"Analysis for:")
     # print(f"\tPlanned fiscal year:\t\t{planned_fy_name}")
@@ -398,9 +432,9 @@ def main(args):
     # 1. Fetch Data
     raw_df = fetch_data(client, all_years_to_query) 
     
-    raw_df = clean(raw_df)
+    raw_df = clean(raw_df, no_amounts=no_amounts, no_positions = no_positions, no_contracts=no_contracts)
     
-    collapsed_df, new_numeric_cols = collapse(raw_df, verbose=True)
+    collapsed_df, new_numeric_cols = collapse(raw_df, latest_interim_only = latest_interim_only)
     
     print()
     for c in collapsed_df.columns:
@@ -423,12 +457,6 @@ def main(args):
     sheets_to_write = {
         "Raw": raw_df,
         "Collapsed": collapsed_df,
-        # "Agency": Agency_collapsed_df,
-        # "Unit of Appropriation": UoA_collapsed_df,
-        # "Responsibility Center": RC_collapsed_df,
-        # "Budget Code": budget_code_collapsed_df,
-        # "Object Class": object_class_collapsed_df,
-        # "Object Code": object_code_collapsed_df,
     }
     
     for level in agg_levels.keys():
@@ -441,23 +469,11 @@ def main(args):
     
     print(sheets_to_write.keys())
     
-    # UoA_df = pivot_by_cols(collapsed_df, agg_levels['Unit of Appropriation'] + ["financial_plan_savings_flag"], numeric_cols = new_numeric_cols)
     
-    # RC_df = pivot_by_cols(collapsed_df, agg_levels['Responsibility Center'] + ["financial_plan_savings_flag"], numeric_cols = new_numeric_cols)
-    
-    # budget_df = pivot_by_cols(collapsed_df, agg_levels['Budget Code'] + ["financial_plan_savings_flag"], numeric_cols = new_numeric_cols)
-    
-    # object_class_df = pivot_by_cols(collapsed_df, agg_levels['Object Class'] + ["financial_plan_savings_flag"], numeric_cols = new_numeric_cols)
-    
-    # object_code_df = pivot_by_cols(collapsed_df, agg_levels['Object Code'] + ["financial_plan_savings_flag"], numeric_cols = new_numeric_cols)
-    
-    # print(object_code_df)
-    
-    
-    # object_code_df.to_excel("object_code_df.xlsx", index=False)
-    # print("saved temp.xlsx")
-    
-    output_filename = f"{planned_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
+    if planned_fy_name != min_fy_name:
+        output_filename = f"{planned_fy_name}_{min_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
+    else:
+        output_filename = f"{planned_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
     
     
 
@@ -468,7 +484,7 @@ def main(args):
             
             # ---> APPLY DIFFERENCES HERE <---
             # Only apply if no_diffs is False and it's not the Raw sheet
-            if k > 0 and not args.no_diffs:
+            if k > 0 and not no_diffs:
                 # Warning: You need to define the diff_kwargs variables for this to run!
                 # df = calculate_differences(df, **diff_kwargs) 
                 pass 
@@ -489,16 +505,6 @@ def main(args):
                     
                     # Check if this column is one of your targets
                     if col_name not in ALL_CATEGORICAL_COLS:
-                        
-                        # Assign formatting style: Currency vs Headcount Positions
-                        # if "position" in col_name.lower() or "contract" in col_name.lower():
-                        #     num_format = '#,##0'   
-                        # elif "%" in col_name.lower():
-                        #     num_format = '#,##0'   
-                        # elif "amount" in col_name.lower():
-                        #     num_format = '$#,##0'  
-                        # else:
-                        #     num_format = '#,##0'   
                         
                         # --- FORMATTING BLOCK ---
                         if "position" in col_name.lower() or "contract" in col_name.lower():
@@ -525,22 +531,22 @@ def main(args):
     return
 
     
-    diff_kwargs = {
-        "num_pubs_this_year": num_pubs_this_year,
-        "current_fy_name": current_fy_name,
-        "str_sum_financial_plan_amount": str_sum_financial_plan_amount,
-        "str_sum_financial_plan_position": str_sum_financial_plan_position,
-        "str_sum_financial_plan_number_of_contracts": str_sum_financial_plan_number_of_contracts,
-        "str_sum_current_adopted_amount": str_sum_current_adopted_amount,
-        "str_sum_current_modified_amount": str_sum_current_modified_amount,
-        "str_sum_current_adopted_position": str_sum_current_adopted_position,
-        "str_sum_current_modified_position": str_sum_current_modified_position,
-        "str_sum_current_adopted_number_of_contracts": str_sum_current_adopted_number_of_contracts,
-        "str_sum_current_modified_number_of_contracts": str_sum_current_modified_number_of_contracts,
-        "include_contracts": args.include_contracts
-    }
+    # diff_kwargs = {
+    #     "num_pubs_this_year": num_pubs_this_year,
+    #     "current_fy_name": current_fy_name,
+    #     "str_sum_financial_plan_amount": str_sum_financial_plan_amount,
+    #     "str_sum_financial_plan_position": str_sum_financial_plan_position,
+    #     "str_sum_financial_plan_number_of_contracts": str_sum_financial_plan_number_of_contracts,
+    #     "str_sum_current_adopted_amount": str_sum_current_adopted_amount,
+    #     "str_sum_current_modified_amount": str_sum_current_modified_amount,
+    #     "str_sum_current_adopted_position": str_sum_current_adopted_position,
+    #     "str_sum_current_modified_position": str_sum_current_modified_position,
+    #     "str_sum_current_adopted_number_of_contracts": str_sum_current_adopted_number_of_contracts,
+    #     "str_sum_current_modified_number_of_contracts": str_sum_current_modified_number_of_contracts,
+    #     "include_contracts": args.include_contracts
+    # }
 
-    export_to_excel(sheets_to_write, output_filename, diff_kwargs)
+    # export_to_excel(sheets_to_write, output_filename, diff_kwargs)
 
 
 if __name__ == "__main__":
@@ -548,7 +554,10 @@ if __name__ == "__main__":
     parser.add_argument("--fiscal_year", type=int, default=2027, help="Target fiscal year for analysis. (Default: 2027)")
     parser.add_argument("--num_prev_years", type=int, default=0, help="Number of previous fiscal years for analysis. (Default: 0)")
     parser.add_argument("--no_diffs", action="store_true", help="Skips calculating differences between financial plans.")
-    parser.add_argument("--include_contracts", action="store_true", help="Includes number of contracts columns in analysis.")
+    parser.add_argument("--no_amounts", action="store_true", help="Removes amount columns from analysis.")
+    parser.add_argument("--no_positions", action="store_true", help="Removes position columns from analysis.")
+    parser.add_argument("--no_contracts", action="store_true", help="Removes number of contract columns from analysis.")
+    parser.add_argument("--latest_interim_only", action="store_true", help="Keeps prelim and exec releases only for the most recent fiscal year.")
     
     args = parser.parse_args()
     main(args)
