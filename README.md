@@ -18,7 +18,6 @@ New York City's expense budget has three official releases each fiscal year: **P
 
 - **`apiv8.py`**: the pipeline script. This is the one to run.
 - **`data_cache/`**: local cache of raw API pulls, one file per fiscal year (gitignored; rebuilt automatically as needed).
-- **`Docs/`**: Some official NYC Office of Management and Budget release documents kept for manual reference: `erc*.pdf` (Adopted Expense/Revenue/Contract volume), `perc*.pdf` (Preliminary version of the same), `ss*.pdf` (Supporting Schedules), and `Expense_Budget_Data_Dictionary.xlsx` (field definitions for the Socrata dataset).
 
 ## Setup
 
@@ -26,7 +25,7 @@ New York City's expense budget has three official releases each fiscal year: **P
    ```
    pip install -r requirements.txt
    ```
-2. Get a Socrata app token at the [NYC Open Data developer settings page](https://data.cityofnewyork.us/profile/edit/developer_settings), then:
+2. (Optional) A Socrata app token raises the API's rate limit; the program runs fine without one. To add one, get a token at the [NYC Open Data developer settings page](https://data.cityofnewyork.us/profile/edit/developer_settings), then:
 
    ```
    cp .env.example .env

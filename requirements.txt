@@ -13,3 +13,4 @@ openpyxl
 sodapy
 python-dotenv
 pyarrow
+requests

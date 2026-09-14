@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 from openpyxl.utils import get_column_letter
 from sodapy import Socrata
@@ -103,25 +104,39 @@ def safe_pct_change(change_series: pd.Series, base_series: pd.Series) -> pd.Seri
 
 # --- Authentication ---
 
-def get_app_key() -> str:
-    """Loads SOCRATA_APP_KEY from .env. Raises if it isn't set."""
+def get_app_key() -> Optional[str]:
+    """
+    Loads SOCRATA_APP_KEY from .env and validates it against Socrata. An app token is
+    optional for reading this public dataset (it just raises the rate limit), so a
+    missing, blank, or rejected token falls back to None (unauthenticated) instead of
+    stopping the program.
+    """
     load_dotenv(dotenv_path=ENV_PATH)
     key = os.getenv("SOCRATA_APP_KEY")
     if not key:
-        raise RuntimeError(
-            "SOCRATA_APP_KEY is not set. Copy .env.example to .env "
-            "and fill in your Socrata app token."
-        )
+        print("SOCRATA_APP_KEY is not set; continuing without an app token "
+              "(unauthenticated requests are subject to Socrata's stricter rate limits).")
+        return None
+
+    try:
+        _build_client(key).get(EXPENSE_DATASET_ID, select="COUNT(*)", limit=1)
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            print("SOCRATA_APP_KEY was rejected by Socrata (invalid or expired); "
+                  "continuing without an app token.")
+            return None
+        raise
+
     return key
 
 
-def _build_client(app_key: str) -> Socrata:
+def _build_client(app_key: Optional[str]) -> Socrata:
     return Socrata("data.cityofnewyork.us", app_key, timeout=180)
 
 
 # --- Fetching ---
 
-def _fetch_page(app_key: str, dataset_id: str, select: str, where: str, order: str,
+def _fetch_page(app_key: Optional[str], dataset_id: str, select: str, where: str, order: str,
                  limit: int, offset: int, max_retries: int = 4) -> list:
     """Fetches a single page of results, retrying transient failures with backoff."""
     last_err: Optional[Exception] = None
@@ -154,7 +169,7 @@ def _apply_categorical_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _fetch_year_data(app_key: str, fiscal_years: List[int], max_workers: int) -> pd.DataFrame:
+def _fetch_year_data(app_key: Optional[str], fiscal_years: List[int], max_workers: int) -> pd.DataFrame:
     """Fetches raw rows for the given fiscal years from Socrata, in parallel, restricted to needed columns."""
     where_string = f"fiscal_year IN ({','.join(str(y) for y in fiscal_years)})"
     select_cols = ", ".join(REMOTE_SELECT_COLS)
@@ -220,7 +235,7 @@ def _is_year_immutable(df: pd.DataFrame) -> bool:
     return "adopt" in set(df["release_type"].dropna().unique())
 
 
-def _is_cache_stale(app_key: str, fy: int, cached_df: pd.DataFrame) -> bool:
+def _is_cache_stale(app_key: Optional[str], fy: int, cached_df: pd.DataFrame) -> bool:
     """Cheaply checks whether NYC has published a newer release for this fiscal year."""
     client = _build_client(app_key)
     result = client.get(
@@ -241,7 +256,7 @@ def _is_cache_stale(app_key: str, fy: int, cached_df: pd.DataFrame) -> bool:
     return remote_count != cached_count
 
 
-def fetch_data(app_key: str, all_years_to_query: List[int],
+def fetch_data(app_key: Optional[str], all_years_to_query: List[int],
                 max_workers: int = MAX_WORKERS_DEFAULT, refresh_cache: bool = False) -> pd.DataFrame:
     """Fetches data for each requested fiscal year, reusing a per-year cache where possible."""
     DATA_CACHE.mkdir(parents=True, exist_ok=True)
@@ -537,7 +552,9 @@ def export_to_excel(sheets_to_write: Dict[str, pd.DataFrame], output_filename: s
 
 
 def main(args):
-    print(f"args: {args}")
+    verbose = args.verbose
+    if verbose:
+        print(f"args: {args}")
 
     planned_fy = args.fiscal_year
     num_prev_years = args.num_prev_years
@@ -565,14 +582,15 @@ def main(args):
     # 1. Fetch Data
     raw_df = fetch_data(app_key, all_years_to_query, max_workers=max_workers, refresh_cache=refresh_cache)
 
-    raw_df = clean(raw_df, no_amounts=no_amounts, no_positions=no_positions, no_contracts=no_contracts)
+    raw_df = clean(raw_df, no_amounts=no_amounts, no_positions=no_positions, no_contracts=no_contracts, verbose=verbose)
 
-    collapsed_df, new_numeric_cols = collapse(raw_df, latest_interim_only=latest_interim_only)
+    collapsed_df, new_numeric_cols = collapse(raw_df, latest_interim_only=latest_interim_only, verbose=verbose)
 
-    print()
-    for c in collapsed_df.columns:
-        print(c)
-    print()
+    if verbose:
+        print()
+        for c in collapsed_df.columns:
+            print(c)
+        print()
 
     # 2. Build Aggregation Dictionaries
     agg_levels = {
@@ -593,7 +611,8 @@ def main(args):
         agg_df = pivot_by_cols(collapsed_df, group_by_cols, numeric_cols=new_numeric_cols)
         sheets_to_write[level] = agg_df
 
-    print(sheets_to_write.keys())
+    if verbose:
+        print(sheets_to_write.keys())
 
     if planned_fy_name != min_fy_name:
         output_filename = f"{planned_fy_name}_{min_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
@@ -615,6 +634,7 @@ if __name__ == "__main__":
     parser.add_argument("--latest_interim_only", action="store_true", help="Keeps prelim and exec releases only for the most recent fiscal year.")
     parser.add_argument("--refresh_cache", action="store_true", help="Bypasses the local per-fiscal-year cache and re-fetches all requested fiscal years from Socrata.")
     parser.add_argument("--max_workers", type=int, default=MAX_WORKERS_DEFAULT, help=f"Number of parallel worker threads for paginated API fetches. (Default: {MAX_WORKERS_DEFAULT})")
+    parser.add_argument("--verbose", action="store_true", help="Print low-level debug detail (raw args, full column lists, per-release internals).")
 
     args = parser.parse_args()
     main(args)
