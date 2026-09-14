@@ -1,7 +1,20 @@
 /.vscode
+/.claude
 .DS_Store
 /Docs
-/Python/data_cache
+/data_cache
+
+# Generated pipeline outputs (regenerable by apiv8.py and its predecessors)
+*_expenses_v*.xlsx
+current_api_*.xlsx
+final_export_*.xlsx
+backup_*.csv
+~$*.xlsx
+CLAUDE.md
+
+# Untracked reference/snapshot data (kept locally, not in version control)
+/2027/
+/Expense_Budget_20260520.xlsx
 
 
 # Byte-compiled / optimized / DLL files
