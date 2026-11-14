@@ -1,0 +1,8 @@
+# Extra dependencies for the exploratory notebooks in "dead notebooks/" only.
+-r requirements.txt
+matplotlib
+ipykernel
+jupyter
+ipywidgets
+camelot-py[cv]
+pdfplumber

@@ -1,16 +1,12 @@
+# Pipeline (apiv8.py) and site data build (scripts/build_site_data.py)
 numpy
 pandas
-matplotlib
-ipykernel
-camelot-py[cv]
-pdfplumber
-tqdm
-jupyter
-ipywidgets
-
 openpyxl
-
-sodapy
-python-dotenv
 pyarrow
 requests
+sodapy
+python-dotenv
+tqdm
+
+# Tests
+pytest
