@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,7 +16,8 @@ from sodapy import Socrata
 from tqdm.auto import tqdm
 
 # --- Configuration & Constants ---
-VERSION = "8"
+# Part of the cache and output filenames: bump when the cached data's shape changes.
+VERSION = "9"
 EXPENSE_DATASET_ID = "mwzb-yiwb"
 RELEASE_NAMES = ["prelim", "exec", "adopt"]
 
@@ -61,6 +62,18 @@ OUTPUT_ORDER = [
 ]
 
 TARGET_CATEGORICAL_COLS = TARGET_CATEGORICAL_COL_CODES + TARGET_CATEGORICAL_COL_NAMES
+
+BLANK_LABEL = "(blank)"
+
+# Aggregation sheets: each level groups by a prefix of OUTPUT_ORDER (code + name pairs).
+AGG_LEVELS = {
+    "Agency": OUTPUT_ORDER[:2],
+    "Unit of Appropriation": OUTPUT_ORDER[:4],
+    "Responsibility Center": OUTPUT_ORDER[:6],
+    "Budget Code": OUTPUT_ORDER[:8],
+    "Object Class": OUTPUT_ORDER[:10],
+    "Object Code": OUTPUT_ORDER[:12],
+}
 
 ALL_CATEGORICAL_COLS = ["publication_date", "fiscal_year", "release_type"] + TARGET_CATEGORICAL_COLS
 
@@ -153,19 +166,27 @@ def _fetch_page(app_key: Optional[str], dataset_id: str, select: str, where: str
 
 
 def _assign_release_types(df: pd.DataFrame, fiscal_years: List[int]) -> pd.DataFrame:
-    """Labels each row's publication_date as prelim/exec/adopt, per fiscal year."""
+    """
+    Labels each row's publication_date as prelim/exec/adopt, per fiscal year. Dates are matched
+    positionally (earliest = prelim), keyed by (fiscal_year, publication_date) so two fiscal
+    years that share a publication date can't overwrite each other's labels.
+    """
     releases_map = {}
     for y in fiscal_years:
         y_releases = sorted(df.loc[df["fiscal_year"] == str(y), "publication_date"].unique().tolist())
-        for pub_date, release_name in zip(y_releases, RELEASE_NAMES[:len(y_releases)]):
-            releases_map[pub_date] = release_name
-    df["release_type"] = df["publication_date"].map(releases_map)
+        if len(y_releases) > len(RELEASE_NAMES):
+            print(f"WARNING: FY{y} has {len(y_releases)} publication dates {y_releases}; only the "
+                  f"first {len(RELEASE_NAMES)} are labeled {RELEASE_NAMES}, the rest are ignored.")
+        for pub_date, release_name in zip(y_releases, RELEASE_NAMES):
+            releases_map[(str(y), pub_date)] = release_name
+    keys = pd.Series(list(zip(df["fiscal_year"], df["publication_date"])), index=df.index, dtype=object)
+    df["release_type"] = keys.map(releases_map)
     return df
 
 
 def _apply_categorical_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     present_cols = [c for c in ALL_CATEGORICAL_COLS if c in df.columns]
-    df[present_cols] = df[present_cols].astype(str)
+    df[present_cols] = df[present_cols].fillna("").astype(str)
     return df
 
 
@@ -175,7 +196,10 @@ def _fetch_year_data(app_key: Optional[str], fiscal_years: List[int], max_worker
     select_cols = ", ".join(REMOTE_SELECT_COLS)
     order_string = ", ".join([
         "agency_number", "unit_appropriation_number", "responsibility_center_code",
-        "budget_code_number", "object_class_number", "object_code", "publication_date DESC"
+        "budget_code_number", "object_class_number", "object_code", "publication_date DESC",
+        # Unique row id as a final tiebreaker: without it, rows tied on every key above can be
+        # returned in a different order per request, so offset pages duplicate/skip rows.
+        ":id",
     ])
 
     count_client = _build_client(app_key)
@@ -208,6 +232,9 @@ def _fetch_year_data(app_key: Optional[str], fiscal_years: List[int], max_worker
     for offset in offsets:
         data.extend(pages[offset])
 
+    if len(data) != total_rows:
+        raise RuntimeError(f"Fetched {len(data)} rows but Socrata reported {total_rows}; "
+                           "the dataset may have changed mid-download. Re-run to retry.")
     print(f"End of query. Successfully fetched {len(data)} total rows.")
     df = pd.DataFrame.from_records(data)
     df = _apply_categorical_dtypes(df)
@@ -291,14 +318,13 @@ def fetch_data(app_key: Optional[str], all_years_to_query: List[int],
 
 
 def clean(df: pd.DataFrame, no_amounts: bool = False, no_positions: bool = False, no_contracts: bool = False, verbose: bool = False) -> pd.DataFrame:
-    df[TARGET_CATEGORICAL_COLS] = df[TARGET_CATEGORICAL_COLS].astype(str)
+    # Fill empty categorical cells with "(blank)" *before* casting to str, otherwise NaN would
+    # become the literal string "nan" (then "NAN" after uppercasing) and never be filled.
+    df[TARGET_CATEGORICAL_COLS] = df[TARGET_CATEGORICAL_COLS].fillna("").astype(str)
 
     for cat_col in TARGET_CATEGORICAL_COLS:
         if cat_col in df.columns:
-            df[cat_col] = df[cat_col].str.upper()
-
-    # Fill empty categorical cells with "(blank)"
-    df[TARGET_CATEGORICAL_COLS] = df[TARGET_CATEGORICAL_COLS].fillna("(blank)")
+            df[cat_col] = df[cat_col].str.strip().str.upper().replace({"": BLANK_LABEL})
 
     # --- FILTER NUMERICAL COLUMNS ---
     active_num_cols = NUMERICAL_COLS.copy()
@@ -339,7 +365,8 @@ def clean(df: pd.DataFrame, no_amounts: bool = False, no_positions: bool = False
     return df.sort_values(by=order, ascending=ascending).reset_index(drop=True)
 
 
-def collapse(clean_df: pd.DataFrame, latest_interim_only: bool = False, verbose: bool = False) -> pd.DataFrame:
+def collapse(clean_df: pd.DataFrame, latest_interim_only: bool = False,
+             verbose: bool = False) -> Tuple[pd.DataFrame, List[str]]:
 
     collapsed_df = clean_df[TARGET_CATEGORICAL_COLS].drop_duplicates().reset_index(drop=True)
 
@@ -551,39 +578,33 @@ def export_to_excel(sheets_to_write: Dict[str, pd.DataFrame], output_filename: s
     print(f"Successfully saved and formatted multiple sheets to {output_filename}!")
 
 
-def main(args):
-    verbose = args.verbose
-    if verbose:
-        print(f"args: {args}")
-
-    planned_fy = args.fiscal_year
-    num_prev_years = args.num_prev_years
-    no_diffs = args.no_diffs
-    no_amounts = args.no_amounts
-    no_positions = args.no_positions
-    no_contracts = args.no_contracts
-    latest_interim_only = args.latest_interim_only
-    refresh_cache = args.refresh_cache
-    max_workers = args.max_workers
-
-    all_years_to_query = [planned_fy - i for i in range(num_prev_years + 1)]
-    data_range = (max(all_years_to_query), min(all_years_to_query) - 1)
-
-    app_key = get_app_key()
-
-    # Create shorthand FY names
+def output_filename_for(planned_fy: int, num_prev_years: int) -> str:
     planned_fy_name = f"FY{planned_fy % 100}"
-    min_fy_name = f"FY{(min(all_years_to_query) - 1) % 100}"
+    min_fy_name = f"FY{(planned_fy - num_prev_years - 1) % 100}"
+    if planned_fy_name != min_fy_name:
+        return f"{planned_fy_name}_{min_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
+    return f"{planned_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
+
+
+def build_tables(fiscal_year: int, num_prev_years: int = 0, *, app_key: Optional[str] = None,
+                 no_amounts: bool = False, no_positions: bool = False, no_contracts: bool = False,
+                 latest_interim_only: bool = False, refresh_cache: bool = False,
+                 max_workers: int = MAX_WORKERS_DEFAULT,
+                 verbose: bool = False) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+    """
+    Runs fetch -> clean -> collapse -> aggregate and returns ({sheet_name: df}, numeric_cols).
+    Sheets are "Raw", "Collapsed", then one per AGG_LEVELS entry. Diff columns are *not* added
+    here; callers apply calculate_differences() (export_to_excel does so per sheet).
+    """
+    all_years_to_query = [fiscal_year - i for i in range(num_prev_years + 1)]
+    data_range = (max(all_years_to_query), min(all_years_to_query) - 1)
 
     print("Analysis for:")
     print(f"\tAll fiscal years to query:\t{all_years_to_query}")
     print(f"\tData range:\t\t\t{data_range}")
 
-    # 1. Fetch Data
     raw_df = fetch_data(app_key, all_years_to_query, max_workers=max_workers, refresh_cache=refresh_cache)
-
     raw_df = clean(raw_df, no_amounts=no_amounts, no_positions=no_positions, no_contracts=no_contracts, verbose=verbose)
-
     collapsed_df, new_numeric_cols = collapse(raw_df, latest_interim_only=latest_interim_only, verbose=verbose)
 
     if verbose:
@@ -592,35 +613,31 @@ def main(args):
             print(c)
         print()
 
-    # 2. Build Aggregation Dictionaries
-    agg_levels = {
-        "Agency": OUTPUT_ORDER[:2],
-        "Unit of Appropriation": OUTPUT_ORDER[:4],
-        "Responsibility Center": OUTPUT_ORDER[:6],
-        "Budget Code": OUTPUT_ORDER[:8],
-        "Object Class": OUTPUT_ORDER[:10],
-        "Object Code": OUTPUT_ORDER[:12],
-    }
-
-    sheets_to_write = {
-        "Raw": raw_df,
-        "Collapsed": collapsed_df,
-    }
-
-    for level, group_by_cols in agg_levels.items():
-        agg_df = pivot_by_cols(collapsed_df, group_by_cols, numeric_cols=new_numeric_cols)
-        sheets_to_write[level] = agg_df
+    sheets: Dict[str, pd.DataFrame] = {"Raw": raw_df, "Collapsed": collapsed_df}
+    for level, group_by_cols in AGG_LEVELS.items():
+        sheets[level] = pivot_by_cols(collapsed_df, group_by_cols, numeric_cols=new_numeric_cols)
 
     if verbose:
-        print(sheets_to_write.keys())
+        print(sheets.keys())
 
-    if planned_fy_name != min_fy_name:
-        output_filename = f"{planned_fy_name}_{min_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
-    else:
-        output_filename = f"{planned_fy_name}_expenses_v{VERSION}_{date.today()}.xlsx"
+    return sheets, new_numeric_cols
 
-    # 3. Write Excel workbook (diffs computed here, gated on --no_diffs)
-    export_to_excel(sheets_to_write, output_filename, no_diffs=no_diffs, target_fy=planned_fy)
+
+def main(args):
+    if args.verbose:
+        print(f"args: {args}")
+
+    sheets_to_write, _ = build_tables(
+        args.fiscal_year, args.num_prev_years,
+        app_key=get_app_key(),
+        no_amounts=args.no_amounts, no_positions=args.no_positions, no_contracts=args.no_contracts,
+        latest_interim_only=args.latest_interim_only, refresh_cache=args.refresh_cache,
+        max_workers=args.max_workers, verbose=args.verbose,
+    )
+
+    # Diffs are computed while writing, gated on --no_diffs
+    export_to_excel(sheets_to_write, output_filename_for(args.fiscal_year, args.num_prev_years),
+                    no_diffs=args.no_diffs, target_fy=args.fiscal_year)
 
 
 if __name__ == "__main__":
